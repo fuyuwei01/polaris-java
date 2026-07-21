@@ -17,6 +17,10 @@
 
 package com.tencent.polaris.plugins.configfilefilter;
 
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.function.Function;
+
 import com.tencent.polaris.api.exception.PolarisException;
 import com.tencent.polaris.api.exception.ServerCodes;
 import com.tencent.polaris.api.plugin.PluginType;
@@ -29,32 +33,44 @@ import com.tencent.polaris.factory.config.configuration.CryptoConfigImpl;
 import com.tencent.polaris.plugins.configfilefilter.service.RSAService;
 import org.junit.Before;
 import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.mockito.Mock;
-import org.mockito.junit.MockitoJUnitRunner;
 
-import java.util.HashMap;
-import java.util.function.Function;
-
-import static org.junit.Assert.assertEquals;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.when;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * @author fabian4
  * @date 2023/6/14
  */
-@RunWith(MockitoJUnitRunner.class)
 public class CryptoConfigFileFilterTest {
 
-    @Mock
     private Crypto crypto;
 
-    @Mock
     private RSAService rsaService;
+
+    /**
+     * 可控返回值的 RSAService 桩，避免依赖 Mockito 静态代理。
+     */
+    private static final class StubRSAService extends RSAService {
+
+        private final byte[] decrypted;
+
+        StubRSAService(byte[] decrypted) {
+            this.decrypted = decrypted;
+        }
+
+        @Override
+        public String getPKCS1PublicKey() {
+            return "RSAPublicKey";
+        }
+
+        @Override
+        public byte[] decrypt(String context) {
+            return decrypted;
+        }
+    }
 
     @Before
     public void setUp() {
+        rsaService = new StubRSAService(null);
         crypto = new Crypto() {
             @Override
             public void doEncrypt(ConfigFile configFile) {
@@ -91,20 +107,19 @@ public class CryptoConfigFileFilterTest {
 
             }
         };
-
-        when(rsaService.getPKCS1PublicKey()).thenReturn("RSAPublicKey");
-        when(rsaService.decrypt(any())).thenReturn(null);
     }
 
     @Test
     public void testDoFilter() {
         String content = "content";
-        ConfigFile configFile = new ConfigFile("namespace",  "group", "fileName");
+        ConfigFile configFile = new ConfigFile("namespace", "group", "fileName");
         configFile.setContent(content);
 
-        CryptoConfigFileFilter cryptoConfigFileFilter = new CryptoConfigFileFilter(crypto, rsaService, new CryptoConfigImpl(), new HashMap<>());
+        CryptoConfigFileFilter cryptoConfigFileFilter =
+                new CryptoConfigFileFilter(crypto, rsaService, new CryptoConfigImpl(), new HashMap<>());
 
-        ConfigFileResponse response = cryptoConfigFileFilter.doFilter(configFile, new Function<ConfigFile, ConfigFileResponse>() {
+        ConfigFileResponse response = cryptoConfigFileFilter.doFilter(configFile,
+                new Function<ConfigFile, ConfigFileResponse>() {
             @Override
             public ConfigFileResponse apply(ConfigFile configFile) {
                 configFile.setContent(configFile.getContent() + "-apply");
@@ -114,8 +129,74 @@ public class CryptoConfigFileFilterTest {
         }).apply(configFile);
 
         String res = content + "-apply" + "-doCrypto";
-        assertEquals(res, response.getConfigFile().getContent());
-        assertEquals("RSAPublicKey", configFile.getDataKey());
+        assertThat(response.getConfigFile().getContent()).isEqualTo(res);
+        assertThat(configFile.getDataKey()).isEqualTo("RSAPublicKey");
     }
 
+    /**
+     * 测试传输加密配置解密成功后回填 decryptedDataKey
+     * 测试目的：验证 doFilter 在解密成功路径回填 AES 密钥，供缓存加密使用
+     * 测试场景：dataKey 非空、响应码成功
+     * 验证内容：response.getConfigFile().getDecryptedDataKey() 与 rsaService.decrypt 返回值一致
+     */
+    @Test
+    public void testDoFilter_EncryptedConfig_SetDecryptedDataKey() {
+        // Arrange
+        byte[] password = "1234567890123456".getBytes(StandardCharsets.UTF_8);
+        rsaService = new StubRSAService(password);
+        String content = "secretContent";
+        ConfigFile configFile = new ConfigFile("namespace", "group", "fileName");
+        configFile.setContent(content);
+
+        CryptoConfigFileFilter cryptoConfigFileFilter =
+                new CryptoConfigFileFilter(crypto, rsaService, new CryptoConfigImpl(), new HashMap<>());
+
+        // Act
+        ConfigFileResponse response = cryptoConfigFileFilter.doFilter(configFile,
+                new Function<ConfigFile, ConfigFileResponse>() {
+                    @Override
+                    public ConfigFileResponse apply(ConfigFile configFile) {
+                        configFile.setContent(configFile.getContent() + "-apply");
+                        configFile.setDataKey("encryptedDataKey");
+                        return new ConfigFileResponse(ServerCodes.EXECUTE_SUCCESS, "OK", configFile);
+                    }
+                }).apply(configFile);
+
+        // Assert
+        assertThat(response.getCode()).isEqualTo(ServerCodes.EXECUTE_SUCCESS);
+        assertThat(response.getConfigFile().getDecryptedDataKey()).isEqualTo(password);
+    }
+
+    /**
+     * 测试明文配置（无 dataKey）不回填 decryptedDataKey
+     * 测试目的：验证明文拉取的配置不会误触发密钥回填
+     * 测试场景：响应成功但 dataKey 为 null
+     * 验证内容：response.getConfigFile().getDecryptedDataKey() 为 null
+     */
+    @Test
+    public void testDoFilter_PlaintextConfig_NoDataKey() {
+        // Arrange
+        byte[] password = "1234567890123456".getBytes(StandardCharsets.UTF_8);
+        rsaService = new StubRSAService(password);
+        String content = "plainContent";
+        ConfigFile configFile = new ConfigFile("namespace", "group", "fileName");
+        configFile.setContent(content);
+
+        CryptoConfigFileFilter cryptoConfigFileFilter =
+                new CryptoConfigFileFilter(crypto, rsaService, new CryptoConfigImpl(), new HashMap<>());
+
+        // Act：服务端返回时 dataKey 为 null（明文配置）
+        ConfigFileResponse response = cryptoConfigFileFilter.doFilter(configFile,
+                new Function<ConfigFile, ConfigFileResponse>() {
+                    @Override
+                    public ConfigFileResponse apply(ConfigFile configFile) {
+                        configFile.setContent(configFile.getContent() + "-apply");
+                        return new ConfigFileResponse(ServerCodes.EXECUTE_SUCCESS, "OK", configFile);
+                    }
+                }).apply(configFile);
+
+        // Assert
+        assertThat(response.getCode()).isEqualTo(ServerCodes.EXECUTE_SUCCESS);
+        assertThat(response.getConfigFile().getDecryptedDataKey()).isNull();
+    }
 }

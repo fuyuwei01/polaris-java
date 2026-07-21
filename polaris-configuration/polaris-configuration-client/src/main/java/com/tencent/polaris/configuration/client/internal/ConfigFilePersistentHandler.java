@@ -19,11 +19,14 @@ package com.tencent.polaris.configuration.client.internal;
 
 
 import com.fasterxml.jackson.dataformat.yaml.YAMLMapper;
+import com.tencent.polaris.api.exception.PolarisException;
 import com.tencent.polaris.api.plugin.configuration.ConfigFile;
+import com.tencent.polaris.api.utils.StringUtils;
 import com.tencent.polaris.api.utils.ThreadPoolUtils;
 import com.tencent.polaris.client.api.SDKContext;
 import com.tencent.polaris.client.util.NamedThreadFactory;
 import com.tencent.polaris.client.util.Utils;
+import com.tencent.polaris.encrypt.util.AESUtil;
 import com.tencent.polaris.factory.util.FileUtils;
 import com.tencent.polaris.logging.LoggerFactory;
 import org.slf4j.Logger;
@@ -37,6 +40,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Base64;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -122,17 +126,20 @@ public class ConfigFilePersistentHandler {
      */
     public void saveConfigFile(ConfigFile configFile) {
         int retryTimes = 0;
-        LOG.info("start to save config file {}", configFile);
+        LOG.info("start to save config file {}/{}/{}",
+                configFile.getNamespace(), configFile.getFileGroup(), configFile.getFileName());
         while (retryTimes <= maxWriteRetry) {
             retryTimes++;
             Path path = doSaveConfigFile(configFile);
             if (null == path) {
                 continue;
             }
-            LOG.info("end to save config file {} to {}", configFile, path);
+            LOG.info("end to save config file {}/{}/{} to {}",
+                    configFile.getNamespace(), configFile.getFileGroup(), configFile.getFileName(), path);
             return;
         }
-        LOG.error("fail to persist config file {} after retry {}", configFile, retryTimes);
+        LOG.error("fail to persist config file {}/{}/{} after retry {}",
+                configFile.getNamespace(), configFile.getFileGroup(), configFile.getFileName(), retryTimes);
     }
 
     private static String configFileToFileName(ConfigFile configFile) {
@@ -169,11 +176,44 @@ public class ConfigFilePersistentHandler {
                 LOG.warn("tmp file {} already exists", persistTmpFile.getAbsolutePath());
             }
         }
+        // 若带已解密 AES 密钥，加密 content 并改写 dataKey 字段，避免明文落盘
+        ConfigFile writeConfigFile = configFile;
+        byte[] dataKey = configFile.getDecryptedDataKey();
+        if (dataKey != null && dataKey.length > 0) {
+            writeConfigFile = copyForPersist(configFile);
+            String encryptedContent = AESUtil.encrypt(writeConfigFile.getContent(), dataKey);
+            writeConfigFile.setContent(encryptedContent);
+            writeConfigFile.setDataKey(Base64.getEncoder().encodeToString(dataKey));
+            LOG.info("start to save encrypted config file {}", writeConfigFile);
+        } else {
+            LOG.info("start to save config file {}", writeConfigFile);
+        }
         try (FileOutputStream outputFile = new FileOutputStream(persistTmpFile)) {
-            String jsonAsYaml = new YAMLMapper().writeValueAsString(configFile);
+            String jsonAsYaml = new YAMLMapper().writeValueAsString(writeConfigFile);
             outputFile.write(jsonAsYaml.getBytes(StandardCharsets.UTF_8));
             outputFile.flush();
         }
+    }
+
+    /**
+     * 全字段拷贝 ConfigFile，用于加密落盘时避免污染内存中的原始对象。
+     * transient 的 decryptedDataKey 不拷贝，实现业务对象不带密钥的安全隔离。
+     *
+     * @param source 源配置文件
+     * @return 拷贝后的配置文件
+     */
+    private ConfigFile copyForPersist(ConfigFile source) {
+        ConfigFile copy = new ConfigFile(source.getNamespace(), source.getFileGroup(),
+                source.getFileName());
+        copy.setContent(source.getContent());
+        copy.setVersion(source.getVersion());
+        copy.setName(source.getName());
+        copy.setMd5(source.getMd5());
+        copy.setDataKey(source.getDataKey());
+        copy.setPublicKey(source.getPublicKey());
+        copy.setEncrypted(source.isEncrypted());
+        copy.setReleaseTime(source.getReleaseTime());
+        return copy;
     }
 
     private Path doSaveConfigFile(ConfigFile configFile) {
@@ -193,7 +233,7 @@ public class ConfigFilePersistentHandler {
             writeTmpFile(persistTmpFile, persistLockFile, configFile);
             Files.move(FileSystems.getDefault().getPath(persistTmpFile.getAbsolutePath()),
                     persistPath, REPLACE_EXISTING, ATOMIC_MOVE);
-        } catch (IOException e) {
+        } catch (Exception e) {
             LOG.error("fail to write file :" + persistTmpFile, e);
             return null;
         }
@@ -252,8 +292,24 @@ public class ConfigFilePersistentHandler {
             resConfigFile.setContent(jsonMap.get("content").toString());
             resConfigFile.setMd5(jsonMap.get("md5").toString());
             resConfigFile.setVersion(Long.valueOf(String.valueOf(jsonMap.get("version"))));
+            // 若缓存文件带 dataKey（加密缓存），解密 content
+            Object dataKeyObj = jsonMap.get("dataKey");
+            if (dataKeyObj != null) {
+                String dataKeyStr = dataKeyObj.toString();
+                if (StringUtils.isNotBlank(dataKeyStr)) {
+                    try {
+                        byte[] dataKey = Base64.getDecoder().decode(dataKeyStr);
+                        String decryptedContent = AESUtil.decrypt(resConfigFile.getContent(), dataKey);
+                        resConfigFile.setContent(decryptedContent);
+                    } catch (Exception e) {
+                        // 老版本缓存或损坏的 dataKey，按明文处理
+                        LOG.warn("fail to decrypt cached content with dataKey, treat as plaintext. file: {}",
+                                persistFile.getName());
+                    }
+                }
+            }
             return resConfigFile;
-        } catch (IOException e) {
+        } catch (IOException | PolarisException e) {
             LOG.warn("fail to read file :" + persistFile.getAbsoluteFile(), e);
             return null;
         } finally {

@@ -277,7 +277,9 @@ public class RemoteConfigFileRepo extends AbstractConfigFileRepo {
         if (fallbackToLocalCache) {
             ConfigFile configFileRes = configFilePersistHandler.loadPersistedConfigFile(configFileReq, needRetry);
             if (configFileRes != null) {
-                LOGGER.info("[Config] load local cache success.{}.", configFileRes);
+                LOGGER.info("[Config] load local cache success. {}/{}/{} version={}",
+                        configFileRes.getNamespace(), configFileRes.getFileGroup(),
+                        configFileRes.getFileName(), configFileRes.getVersion());
                 remoteConfigFile.set(configFileRes);
                 //配置有更新，触发回调
                 fireChangeEvent(configFileRes);

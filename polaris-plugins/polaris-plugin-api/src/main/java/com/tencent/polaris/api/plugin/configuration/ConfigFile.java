@@ -17,6 +17,7 @@
 
 package com.tencent.polaris.api.plugin.configuration;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.google.protobuf.BoolValue;
 import com.google.protobuf.StringValue;
 import com.google.protobuf.UInt64Value;
@@ -42,6 +43,16 @@ public class ConfigFile extends BaseEntity {
     private String dataKey;
     private boolean encrypted = Boolean.FALSE;
     private Date releaseTime;
+
+    /**
+     * 已解密的 AES 数据密钥，仅用于内存中跨层传递，供缓存加密使用。
+     * <p>
+     * transient + @JsonIgnore 双重保险，确保不被任何序列化（YAMLMapper、Java 原生序列化）写入；
+     * 不参与 equals/hashCode/toString，密钥不会进日志；deepClone 也不拷贝，业务对象天然不带密钥。
+     * </p>
+     */
+    @JsonIgnore
+    private transient byte[] decryptedDataKey;
 
     public ConfigFile(String namespace, String fileGroup, String fileName) {
         this.namespace = namespace;
@@ -135,6 +146,14 @@ public class ConfigFile extends BaseEntity {
 
     public void setReleaseTime(Date releaseTime) {
         this.releaseTime = releaseTime;
+    }
+
+    public byte[] getDecryptedDataKey() {
+        return decryptedDataKey;
+    }
+
+    public void setDecryptedDataKey(byte[] decryptedDataKey) {
+        this.decryptedDataKey = decryptedDataKey;
     }
 
     @Override

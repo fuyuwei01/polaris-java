@@ -78,10 +78,12 @@ public class CryptoConfigFileFilter implements ConfigFileFilter {
                             LOG.info("ConfigFile [namespace: {}, file group: {}, file name: {}] does not have data key. "
                                             + "Return original response.",
                                     configFile.getNamespace(), configFile.getFileGroup(), configFile.getFileName());
-                            return response;
-                        }
+                           return response;
+                       }
                         byte[] password = rsaService.decrypt(dataKey);
                         crypto.doDecrypt(configFileResponse, password);
+                        // 回填已解密的 AES 密钥，供后续缓存加密使用
+                        configFileResponse.setDecryptedDataKey(password);
                     }
                     return response;
                 } else {
